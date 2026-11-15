@@ -342,6 +342,7 @@ func (b *FilamentBridge) monitorMoonraker(printerID string, config PrinterConfig
 		b.mutex.Lock()
 		b.wasPrinting[printerID] = false
 		b.currentJobFile[printerID] = ""
+		b.printStartTime[printerID] = time.Time{}
 		b.previousState[printerID] = currentState
 		b.mutex.Unlock()
 

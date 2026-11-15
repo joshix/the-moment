@@ -1993,6 +1993,102 @@ func (b *FilamentBridge) flushPendingSnapshots(printerID string, startTime time.
 	}
 }
 
+// PendingSnapshot is a staged camera snapshot belonging to a printer's current print.
+type PendingSnapshot struct {
+	FilePath   string
+	Label      string
+	CapturedAt string
+}
+
+// GetCurrentPrintPendingSnapshots returns the staged snapshots for the print that is
+// currently tracked on printerID — exactly the set flushPendingSnapshots would attach
+// when that print ends. Returns an empty slice when no print is being tracked, so
+// snapshots left over from earlier prints are never shown as the current print's.
+func (b *FilamentBridge) GetCurrentPrintPendingSnapshots(printerID string) ([]PendingSnapshot, error) {
+	b.mutex.RLock()
+	startTime := b.printStartTime[printerID]
+	b.mutex.RUnlock()
+	snaps := []PendingSnapshot{}
+	if startTime.IsZero() {
+		return snaps, nil
+	}
+	rows, err := b.db.Query(`
+		SELECT file_path, COALESCE(label, ''), captured_at
+		FROM pending_print_snapshots
+		WHERE printer_id = ? AND julianday(print_start_time) = julianday(?)
+		ORDER BY captured_at ASC, id ASC`,
+		printerID, startTime.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s PendingSnapshot
+		if err := rows.Scan(&s.FilePath, &s.Label, &s.CapturedAt); err != nil {
+			continue
+		}
+		snaps = append(snaps, s)
+	}
+	return snaps, rows.Err()
+}
+
+// purgeStalePendingSnapshots deletes staged snapshots on printerID that do not belong
+// to the print started at keepStart, along with their image files. Such rows can never
+// be flushed (flushPendingSnapshots matches on the exact start time), so they are
+// orphans — e.g. from a print that errored before completion, or one that was
+// interrupted before the monitor saw it start. Monitors call this when a new print begins.
+//
+// Monitors must also zero printStartTime wherever they clear currentJobFile. Pending
+// snapshots and runout events are keyed by it, so a stale value files events seen
+// before the next print is detected (e.g. ATTENTION from a job started with the
+// printer's door open) under the previous, already-flushed print, orphaning them.
+func (b *FilamentBridge) purgeStalePendingSnapshots(printerID string, keepStart time.Time) {
+	rows, err := b.db.Query(`
+		SELECT id, file_path, COALESCE(label, '') FROM pending_print_snapshots
+		WHERE printer_id = ? AND julianday(print_start_time) != julianday(?)`,
+		printerID, keepStart.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		log.Printf("[SNAPSHOT] failed to query stale pending snapshots for %s: %v", printerID, err)
+		return
+	}
+	type staleRow struct {
+		id       int
+		filePath string
+		label    string
+	}
+	var stale []staleRow
+	for rows.Next() {
+		var r staleRow
+		if err := rows.Scan(&r.id, &r.filePath, &r.label); err == nil {
+			stale = append(stale, r)
+		}
+	}
+	rows.Close()
+
+	purged := 0
+	for _, r := range stale {
+		absPath := filepath.Join(b.gcodePath(), r.filePath)
+		if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[SNAPSHOT] failed to remove stale pending snapshot %s: %v", absPath, err)
+			continue // keep the row so the file isn't leaked untracked
+		}
+		if _, err := b.db.Exec(`DELETE FROM pending_print_snapshots WHERE id = ?`, r.id); err != nil {
+			log.Printf("[SNAPSHOT] failed to delete stale pending snapshot row %d: %v", r.id, err)
+			continue
+		}
+		// Logged only once the row is gone, so the list and the count below
+		// report what was deleted, not what was found.
+		log.Printf("[SNAPSHOT] purged orphaned pending snapshot id=%d label=%q file=%s for %s",
+			r.id, r.label, r.filePath, printerID)
+		purged++
+	}
+	if purged > 0 {
+		log.Printf("[SNAPSHOT] purged %d orphaned pending snapshot(s) for %s", purged, printerID)
+	}
+}
+
 // ToolheadSpoolAssignment represents a spool-to-toolhead assignment record.
 type ToolheadSpoolAssignment struct {
 	ID               int
@@ -4015,6 +4111,13 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 		b.previousState[printerID] = currentState
 		b.mutex.Unlock()
 
+		if isNewPrint {
+			b.mutex.RLock()
+			newStart := b.printStartTime[printerID]
+			b.mutex.RUnlock()
+			b.purgeStalePendingSnapshots(printerID, newStart)
+		}
+
 		if isNewPrint && jobInfo.ID != 0 {
 			b.mutex.RLock()
 			startedAt := b.printStartTime[printerID]
@@ -4087,7 +4190,10 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 		}
 
 		// Resume snapshot: printer just recovered from an attention/runout event.
-		if prevState == StateAttention {
+		// Skipped when this poll is the print's first detection: an ATTENTION seen
+		// before the print was tracked recorded nothing, so there is no interruption
+		// of this print to pair a "Resumed" snapshot with.
+		if prevState == StateAttention && !isNewPrint {
 			log.Printf("▶️  Print RESUMED on %s (%s): %.1f%% for job: %s",
 				config.IPAddress, printerID, printProgress, jobName)
 			b.mutex.RLock()
@@ -4157,6 +4263,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 				b.mutex.Lock()
 				b.wasPrinting[printerID] = false
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 				b.previousState[printerID] = currentState
 				b.mutex.Unlock()
@@ -4191,6 +4298,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 			b.processingPrints[printerID] = false
 			if handleErr == nil {
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 				b.currentJobID[printerID] = 0
 			}
@@ -4219,6 +4327,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 			b.mutex.Lock()
 			if !b.processingPrints[printerID] {
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 			}
 			b.previousState[printerID] = currentState
@@ -4242,6 +4351,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 				b.mutex.Lock()
 				b.wasPrinting[printerID] = false
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 				b.previousState[printerID] = currentState
 				b.mutex.Unlock()
@@ -4283,6 +4393,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 			b.mutex.Lock()
 			b.processingPrints[printerID] = false
 			b.currentJobFile[printerID] = ""
+			b.printStartTime[printerID] = time.Time{}
 			b.currentJobDisplayName[printerID] = ""
 			b.currentJobID[printerID] = 0
 			b.mutex.Unlock()
@@ -4383,7 +4494,8 @@ func (b *FilamentBridge) monitorBambu(printerID string, config PrinterConfig) er
 
 	case StatePrinting:
 		b.mutex.Lock()
-		if status.GcodeFile != "" && storedJobFile == "" {
+		isNewPrint := status.GcodeFile != "" && storedJobFile == ""
+		if isNewPrint {
 			b.currentJobFile[printerID] = status.GcodeFile
 			b.printStartTime[printerID] = time.Now()
 			log.Printf("[BAMBU] 📁 Stored job filename for %s: %s", printerID, status.GcodeFile)
@@ -4393,8 +4505,13 @@ func (b *FilamentBridge) monitorBambu(printerID string, config PrinterConfig) er
 		startTime := b.printStartTime[printerID]
 		b.mutex.Unlock()
 
-		// Resume snapshot: Bambu print resumed after a pause.
-		if prevState == StatePaused && !startTime.IsZero() {
+		if isNewPrint {
+			b.purgeStalePendingSnapshots(printerID, startTime)
+		}
+
+		// Resume snapshot: Bambu print resumed after a pause. Skipped on the print's
+		// first detection — a pause seen before the print was tracked recorded nothing.
+		if prevState == StatePaused && !isNewPrint && !startTime.IsZero() {
 			log.Printf("[BAMBU] ▶️  Print RESUMED on %s (%s): %.1f%%", printerID, config.Name, progressPct)
 			if err := b.captureInterruptSnapshot(config, printerID, startTime, progressPct, "resume"); err != nil {
 				log.Printf("[BAMBU][SNAPSHOT] resume snapshot failed for %s: %v", config.IPAddress, err)
@@ -4452,6 +4569,7 @@ func (b *FilamentBridge) monitorBambu(printerID string, config PrinterConfig) er
 			b.lastSnapshotPct[printerID] = 0
 			if finishErr == nil {
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 			}
 			b.mutex.Unlock()
@@ -4463,6 +4581,7 @@ func (b *FilamentBridge) monitorBambu(printerID string, config PrinterConfig) er
 			b.mutex.Lock()
 			if !b.processingPrints[printerID] {
 				b.currentJobFile[printerID] = ""
+				b.printStartTime[printerID] = time.Time{}
 				b.currentJobDisplayName[printerID] = ""
 			}
 			b.previousState[printerID] = currentState
@@ -4486,6 +4605,7 @@ func (b *FilamentBridge) monitorBambu(printerID string, config PrinterConfig) er
 			b.processingPrints[printerID] = false
 			b.lastSnapshotPct[printerID] = 0
 			b.currentJobFile[printerID] = ""
+			b.printStartTime[printerID] = time.Time{}
 			b.currentJobDisplayName[printerID] = ""
 			b.mutex.Unlock()
 

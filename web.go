@@ -3905,20 +3905,11 @@ func (ws *WebServer) downloadPrintAttachmentHandler(c *gin.Context) {
 // GET /api/printers/:id/active-snapshots
 func (ws *WebServer) activePrinterSnapshotsHandler(c *gin.Context) {
 	printerID := c.Param("id")
-	rows, err := ws.bridge.db.Query(`
-		SELECT file_path, COALESCE(label,''), captured_at
-		FROM pending_print_snapshots
-		WHERE printer_id = ?
-		  AND julianday(print_start_time) = (
-		      SELECT MAX(julianday(print_start_time)) FROM pending_print_snapshots WHERE printer_id = ?
-		  )
-		ORDER BY captured_at ASC`,
-		printerID, printerID)
+	pending, err := ws.bridge.GetCurrentPrintPendingSnapshots(printerID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
 
 	type snap struct {
 		Filename   string `json:"filename"`
@@ -3926,22 +3917,15 @@ func (ws *WebServer) activePrinterSnapshotsHandler(c *gin.Context) {
 		CapturedAt string `json:"captured_at"`
 		URL        string `json:"url"`
 	}
-	var snaps []snap
-	for rows.Next() {
-		var filePath, label, capturedAt string
-		if err := rows.Scan(&filePath, &label, &capturedAt); err != nil {
-			continue
-		}
-		filename := filepath.Base(filePath)
+	snaps := []snap{}
+	for _, p := range pending {
+		filename := filepath.Base(p.FilePath)
 		snaps = append(snaps, snap{
 			Filename:   filename,
-			Label:      label,
-			CapturedAt: capturedAt,
+			Label:      p.Label,
+			CapturedAt: p.CapturedAt,
 			URL:        "/api/printers/" + printerID + "/active-snapshots/" + filename,
 		})
-	}
-	if snaps == nil {
-		snaps = []snap{}
 	}
 	c.JSON(http.StatusOK, gin.H{"snapshots": snaps})
 }
@@ -4062,27 +4046,14 @@ func (ws *WebServer) activePrintHandler(c *gin.Context) {
 		resp.FilePath = session.FilePath
 	}
 
-	rows, err := ws.bridge.db.Query(`
-		SELECT file_path, COALESCE(label,''), captured_at
-		FROM pending_print_snapshots
-		WHERE printer_id = ?
-		  AND julianday(print_start_time) = (
-		      SELECT MAX(julianday(print_start_time)) FROM pending_print_snapshots WHERE printer_id = ?
-		  )
-		ORDER BY captured_at ASC`,
-		printerID, printerID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var fp, label, capturedAt string
-			if rows.Scan(&fp, &label, &capturedAt) == nil {
-				resp.Snapshots = append(resp.Snapshots, activePrintSnap{
-					Filename:   filepath.Base(fp),
-					Label:      label,
-					CapturedAt: capturedAt,
-					URL:        "/api/printers/" + printerID + "/active-snapshots/" + filepath.Base(fp),
-				})
-			}
+	if pending, err := ws.bridge.GetCurrentPrintPendingSnapshots(printerID); err == nil {
+		for _, p := range pending {
+			resp.Snapshots = append(resp.Snapshots, activePrintSnap{
+				Filename:   filepath.Base(p.FilePath),
+				Label:      p.Label,
+				CapturedAt: p.CapturedAt,
+				URL:        "/api/printers/" + printerID + "/active-snapshots/" + filepath.Base(p.FilePath),
+			})
 		}
 	}
 
